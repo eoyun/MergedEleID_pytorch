@@ -1,0 +1,19 @@
+universe              = vanilla
+executable            = condor/run_train.sh
+
+should_transfer_files = NO
+getenv                = True
+
+request_gpus          = 1
+request_cpus          = $(CPUS)
+request_memory        = $(MEMORY)
++JobFlavour           = "$(FLAVOUR)"
+
+# Distinct condor-side logs per ProcId
+output                = condor/logs/$(label)_$(model)_$(dataset)_$(ClusterId).$(ProcId).out
+error                 = condor/logs/$(label)_$(model)_$(dataset)_$(ClusterId).$(ProcId).err
+log                   = condor/logs/$(label)_$(model)_$(dataset)_$(ClusterId).log
+
+arguments             = "$(label) $(model) $(dataset) $(config) $(extra_args)"
+
+queue label,model,dataset,config,extra_args from condor/jobs.tsv

@@ -1,0 +1,4 @@
+baseline swin_base_in22k 260403_v1 configs/default_train.json -
+baseline resnet50 260403_v1 configs/default_train.json -
+baseline swin_base_in22k 260405_v1 configs/default_train.json -
+baseline resnet101 260405_v1 configs/default_train.json "--run-id manual_override_example"

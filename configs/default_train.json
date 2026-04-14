@@ -1,0 +1,9 @@
+{
+  "batch_size": 32,
+  "num_workers": 4,
+  "epochs": 100,
+  "lr": 1e-5,
+  "random_state": 42,
+  "early_stopping_patience": 10,
+  "use_weighted_val_loss": true
+}

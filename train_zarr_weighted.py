@@ -1,10 +1,15 @@
 import os
 import json
+import shlex
+import socket
+import subprocess
 import numpy as np
 import zarr
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from pathlib import Path
+from datetime import datetime, timezone
 
 import torch
 import torch.nn.functional as F
@@ -18,31 +23,120 @@ from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 import argparse
 
-parser = argparse.ArgumentParser()
+SUPPORTED_DATASETS = {"260403_v1", "260405_v1"}
+DEFAULT_DATA_ROOTS = {
+    "local": Path("/home/eoyun/data"),
+    "lxplus": Path("/eos/home-y/yeo/4l/data"),
+}
+DEFAULT_OUTPUT_ROOTS = {
+    "local": Path("./ckpts/pytorch"),
+    "lxplus": Path("/eos/home-y/yeo/4l/image"),
+}
+MODEL_REGISTRY = {
+    "resnet50": "microsoft/resnet-50",
+    "resnet101": "microsoft/resnet-101",
+    "cvt21": "microsoft/cvt-21",
+    "swin_base_in22k": "microsoft/swin-base-patch4-window7-224-in22k",
+}
 
-parser.add_argument("--out",type=str,required=True)
 
-args = parser.parse_args()
-OUTNAME = args.out
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train image classifier from zarr inputs.")
+    parser.add_argument("--site", choices=["local", "lxplus"], default="local")
+    parser.add_argument("--dataset", required=True, help="Dataset name, e.g. 260403_v1.")
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--label", default=None, help="Sweep label used for output hierarchy.")
+    parser.add_argument("--model", default="swin_base_in22k", help="Model key from registry or HF model id.")
+    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--run-id", default=None, help="Optional run id override.")
+    parser.add_argument("--config", type=Path, default=None, help="Optional JSON config override.")
+    parser.add_argument("--out", default=None, help="Deprecated alias for label (kept for compatibility).")
+    return parser.parse_args()
+
+
+def resolve_model_name(model_arg):
+    return MODEL_REGISTRY.get(model_arg, model_arg)
+
+
+def _must_exist(path: Path, description: str):
+    if not path.exists():
+        raise FileNotFoundError(f"{description} does not exist: {path}")
+    return path
+
+
+def resolve_dataset_files(site, dataset, data_root_override):
+    if dataset not in SUPPORTED_DATASETS:
+        raise ValueError(f"Unsupported dataset '{dataset}'. Supported datasets: {sorted(SUPPORTED_DATASETS)}")
+    base_root = data_root_override or DEFAULT_DATA_ROOTS[site]
+    dataset_root = Path(base_root) / dataset
+    candidate_layouts = [
+        {
+            "dataset_path": dataset_root,
+            "zarr": dataset_root / "train.zarr",
+            "idx": dataset_root / "train_idx.npy",
+            "weight": dataset_root / "train_weight.npy",
+            "group": dataset_root / "train_group.npy",
+        },
+        {
+            "dataset_path": Path(base_root),
+            "zarr": Path(base_root) / "train.zarr",
+            "idx": Path(base_root) / f"train_idx_{dataset}.npy",
+            "weight": Path(base_root) / f"train_weight_{dataset}.npy",
+            "group": Path(base_root) / f"train_group_{dataset}.npy",
+        },
+    ]
+    for layout in candidate_layouts:
+        if all(layout[key].exists() for key in ("zarr", "idx", "weight", "group")):
+            return layout
+    raise FileNotFoundError(
+        "Could not resolve dataset files. Tried layouts rooted at "
+        f"{dataset_root} and {base_root} for dataset {dataset}."
+    )
+
+
+def get_git_short_sha():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "nogit"
+
+
+def build_run_id(run_id_override):
+    if run_id_override:
+        return run_id_override
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    cluster_id = os.getenv("CLUSTER_ID", "nocluster")
+    proc_id = os.getenv("PROCESS_ID", "noproc")
+    return f"{timestamp}_{get_git_short_sha()}_c{cluster_id}_p{proc_id}"
+
+
+def sanitize_path_component(value):
+    return value.replace("/", "__")
+
+
+args = parse_args()
+if args.out and not args.label:
+    args.label = args.out
+if not args.label:
+    raise ValueError("Missing required --label (or legacy --out).")
 
 # =========================================================
 # 0. paths / config
 # =========================================================
-ZARR_PATH = "/home/eoyun/data/train.zarr"
-IDX_PATH = "/home/eoyun/data/train_idx_260403_v1.npy"
-WEIGHT_PATH = "/home/eoyun/data/train_weight_260403_v1.npy"
-GROUP_PATH = "/home/eoyun/data/train_group_260403_v1.npy"
+DATASET_LAYOUT = resolve_dataset_files(args.site, args.dataset, args.data_root)
+ZARR_PATH = str(_must_exist(DATASET_LAYOUT["zarr"], "zarr dataset"))
+IDX_PATH = str(_must_exist(DATASET_LAYOUT["idx"], "idx file"))
+WEIGHT_PATH = str(_must_exist(DATASET_LAYOUT["weight"], "weight file"))
+GROUP_PATH = str(_must_exist(DATASET_LAYOUT["group"], "group file"))
+RESOLVED_DATASET_PATH = str(DATASET_LAYOUT["dataset_path"])
 
-# MODEL_NAME = "microsoft/resnet-50"
-# MODEL_NAME = "microsoft/resnet-101"
-# MODEL_NAME = "microsoft/cvt-21"
-MODEL_NAME = "microsoft/swin-base-patch4-window7-224-in22k"
-
-OUTPUT_DIR = f"./ckpts/pytorch/{OUTNAME}"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-RESULTS_DIR = os.path.join(OUTPUT_DIR, "results")
-os.makedirs(RESULTS_DIR, exist_ok=True)
+MODEL_NAME = resolve_model_name(args.model)
+RUN_ID = build_run_id(args.run_id)
+OUTPUT_ROOT = Path(args.output_root or DEFAULT_OUTPUT_ROOTS[args.site])
+OUTPUT_DIR = OUTPUT_ROOT / args.label / sanitize_path_component(args.model) / args.dataset / RUN_ID
+RESULTS_DIR = OUTPUT_DIR / "results"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RANDOM_STATE = 42
 BATCH_SIZE = 32
@@ -50,13 +144,42 @@ NUM_WORKERS = 4
 EPOCHS = 100
 LR = 1e-5
 EARLY_STOPPING_PATIENCE = 10
-
 USE_WEIGHTED_VAL_LOSS = True
+
+if args.config:
+    config_payload = json.loads(Path(args.config).read_text())
+    RANDOM_STATE = int(config_payload.get("random_state", RANDOM_STATE))
+    BATCH_SIZE = int(config_payload.get("batch_size", BATCH_SIZE))
+    NUM_WORKERS = int(config_payload.get("num_workers", NUM_WORKERS))
+    EPOCHS = int(config_payload.get("epochs", EPOCHS))
+    LR = float(config_payload.get("lr", LR))
+    EARLY_STOPPING_PATIENCE = int(config_payload.get("early_stopping_patience", EARLY_STOPPING_PATIENCE))
+    USE_WEIGHTED_VAL_LOSS = bool(config_payload.get("use_weighted_val_loss", USE_WEIGHTED_VAL_LOSS))
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-os.environ["TRANSFORMERS_CACHE"] = os.getenv("SCRATCH", "/tmp") + "/hf/transformers"
+os.environ["TRANSFORMERS_CACHE"] = os.getenv("TRANSFORMERS_CACHE", os.getenv("SCRATCH", "/tmp") + "/hf/transformers")
 os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
 CACHE_PATH = os.environ["HF_HOME"]
+
+RUN_METADATA_PATH = OUTPUT_DIR / "run.json"
+run_metadata = {
+    "label": args.label,
+    "model": args.model,
+    "resolved_model_name": MODEL_NAME,
+    "dataset": args.dataset,
+    "dataset_path": RESOLVED_DATASET_PATH,
+    "site": args.site,
+    "output_dir": str(OUTPUT_DIR),
+    "hostname": socket.gethostname(),
+    "cluster_id": os.getenv("CLUSTER_ID"),
+    "process_id": os.getenv("PROCESS_ID"),
+    "git_commit_short": get_git_short_sha(),
+    "start_time_utc": datetime.now(timezone.utc).isoformat(),
+    "run_id": RUN_ID,
+    "command": " ".join(shlex.quote(part) for part in [os.path.basename(__file__), *os.sys.argv[1:]]),
+}
+RUN_METADATA_PATH.write_text(json.dumps(run_metadata, indent=2))
 
 
 # =========================================================
@@ -376,21 +499,28 @@ metrics_history = {
 best_val_f1 = -np.inf
 epochs_no_improve = 0
 
-best_model_path = os.path.join(OUTPUT_DIR, "best_model.pt")
-config_path = os.path.join(OUTPUT_DIR, "run_config.json")
+best_model_path = OUTPUT_DIR / "best_model.pt"
+config_path = OUTPUT_DIR / "run_config.json"
 
 with open(config_path, "w") as f:
     json.dump({
+        "site": args.site,
+        "label": args.label,
+        "dataset": args.dataset,
+        "dataset_path": RESOLVED_DATASET_PATH,
         "zarr_path": ZARR_PATH,
         "idx_path": IDX_PATH,
         "weight_path": WEIGHT_PATH,
         "group_path": GROUP_PATH,
+        "model": args.model,
         "model_name": MODEL_NAME,
+        "run_id": RUN_ID,
         "batch_size": BATCH_SIZE,
         "num_workers": NUM_WORKERS,
         "epochs": EPOCHS,
         "lr": LR,
         "random_state": RANDOM_STATE,
+        "use_weighted_val_loss": USE_WEIGHTED_VAL_LOSS,
         "class_names": class_names,
     }, f, indent=2)
 
@@ -827,3 +957,10 @@ np.save(os.path.join(OUTPUT_DIR, "y_true_test.npy"), y_true)
 np.save(os.path.join(OUTPUT_DIR, "y_pred_test.npy"), y_pred)
 
 print(f"\nSaved outputs to: {OUTPUT_DIR}")
+
+run_metadata["end_time_utc"] = datetime.now(timezone.utc).isoformat()
+run_metadata["best_val_f1"] = float(best_val_f1)
+run_metadata["test_f1"] = float(test_f1)
+run_metadata["test_loss"] = float(test_loss)
+run_metadata["best_model_path"] = str(best_model_path)
+RUN_METADATA_PATH.write_text(json.dumps(run_metadata, indent=2))
